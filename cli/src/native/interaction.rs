@@ -38,6 +38,26 @@ pub async fn click(
         .await
         .map_err(|error| format!("Click target could not be scrolled into view: {error}"))?;
 
+    // CDP box coordinates retain the existing frame-to-dispatch coordinate
+    // mapping. getBoundingClientRect below is local to the element's frame.
+    let geometry: DomGetBoxModelResult = client
+        .send_command_typed(
+            "DOM.getBoxModel",
+            &DomGetBoxModelParams {
+                backend_node_id: None,
+                node_id: None,
+                object_id: Some(object_id.clone()),
+            },
+            Some(&effective_session_id),
+        )
+        .await?;
+    let quad = &geometry.model.content;
+    if quad.len() != 8 {
+        return Err("Click target has no actionable position".to_string());
+    }
+    let dispatch_x = (quad[0] + quad[2] + quad[4] + quad[6]) / 4.0;
+    let dispatch_y = (quad[1] + quad[3] + quad[5] + quad[7]) / 4.0;
+
     let result: EvaluateResult = client
         .send_command_typed(
             "Runtime.callFunctionOn",
@@ -70,7 +90,7 @@ pub async fn click(
                         hit = nested;
                     }
                     for (let node = hit; node; node = node.parentNode || node.host) {
-                        if (node === this) return { x, y };
+                        if (node === this) return { x, y, centerX: (rect.left + rect.right) / 2, centerY: (rect.top + rect.bottom) / 2 };
                     }
                     return { error: 'Click target is covered or does not receive pointer input' };
                 }"#
@@ -95,9 +115,13 @@ pub async fn click(
     }
     let x = point.get("x").and_then(Value::as_f64);
     let y = point.get("y").and_then(Value::as_f64);
-    let (Some(x), Some(y)) = (x, y) else {
+    let center_x = point.get("centerX").and_then(Value::as_f64);
+    let center_y = point.get("centerY").and_then(Value::as_f64);
+    let (Some(x), Some(y), Some(center_x), Some(center_y)) = (x, y, center_x, center_y) else {
         return Err("Click target has no actionable position".to_string());
     };
+    let x = dispatch_x + x - center_x;
+    let y = dispatch_y + y - center_y;
     dispatch_click(client, &effective_session_id, x, y, button, click_count).await
 }
 
@@ -1159,7 +1183,7 @@ mod tests {
         let requests = Arc::clone(&seen);
         let point = match error {
             Some(error) => serde_json::json!({ "error": error }),
-            None => serde_json::json!({ "x": 30.0, "y": 40.0 }),
+            None => serde_json::json!({ "x": 30.0, "y": 40.0, "centerX": 30.0, "centerY": 40.0 }),
         };
         let task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
@@ -1174,6 +1198,10 @@ mod tests {
                     }
                     "Runtime.callFunctionOn" => {
                         serde_json::json!({ "result": { "type": "object", "value": point } })
+                    }
+                    "DOM.getBoxModel" => {
+                        let quad = [320.0, 230.0, 340.0, 230.0, 340.0, 250.0, 320.0, 250.0];
+                        serde_json::json!({ "model": { "content": quad, "border": quad, "padding": quad, "margin": quad, "width": 20, "height": 20 } })
                     }
                     _ => serde_json::json!({}),
                 };
@@ -1211,10 +1239,11 @@ mod tests {
             .map(|value| value["method"].as_str().unwrap())
             .collect();
         assert_eq!(
-            methods[..3],
+            methods[..4],
             [
                 "Runtime.evaluate",
                 "DOM.scrollIntoViewIfNeeded",
+                "DOM.getBoxModel",
                 "Runtime.callFunctionOn"
             ]
         );
@@ -1224,8 +1253,8 @@ mod tests {
             .collect();
         assert_eq!(input.len(), 3);
         for request in input {
-            assert_eq!(request["params"]["x"], 30.0);
-            assert_eq!(request["params"]["y"], 40.0);
+            assert_eq!(request["params"]["x"], 330.0);
+            assert_eq!(request["params"]["y"], 240.0);
         }
     }
 
