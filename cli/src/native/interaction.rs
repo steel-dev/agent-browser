@@ -51,7 +51,9 @@ pub async fn click(
             Some(&effective_session_id),
         )
         .await?;
-    let quad = &geometry.model.content;
+    // Match the border-box origin used by getBoundingClientRect, including
+    // asymmetric padding, so validation and dispatch refer to the same point.
+    let quad = &geometry.model.border;
     if quad.len() != 8 {
         return Err("Click target has no actionable position".to_string());
     }
@@ -1201,7 +1203,8 @@ mod tests {
                     }
                     "DOM.getBoxModel" => {
                         let quad = [320.0, 230.0, 340.0, 230.0, 340.0, 250.0, 320.0, 250.0];
-                        serde_json::json!({ "model": { "content": quad, "border": quad, "padding": quad, "margin": quad, "width": 20, "height": 20 } })
+                        let content = [332.0, 236.0, 338.0, 236.0, 338.0, 244.0, 332.0, 244.0];
+                        serde_json::json!({ "model": { "content": content, "border": quad, "padding": quad, "margin": quad, "width": 20, "height": 20 } })
                     }
                     _ => serde_json::json!({}),
                 };
