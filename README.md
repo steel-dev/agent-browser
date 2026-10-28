@@ -134,6 +134,13 @@ agent-browser chat "<instruction>"    # AI chat: natural language browser contro
 agent-browser chat                    # AI chat: interactive REPL mode
 ```
 
+Normal native clicks scroll the resolved target into view, measure its current
+viewport position, and check that it can receive pointer input. Covered,
+disabled, or detached targets fail before pointer dispatch. A successful click
+acknowledges dispatch, not navigation or completion of an application task.
+When navigation is expected, use a bounded `wait --url` followed by `get url`;
+DOM-only buttons, downloads, and new-tab links do not all navigate the current tab.
+
 ### Get Info
 
 ```bash

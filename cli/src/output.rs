@@ -1058,6 +1058,10 @@ Usage: agent-browser click <selector> [--new-tab]
 Clicks on the specified element. The selector can be a CSS selector,
 XPath, or an element reference from snapshot (e.g., @e1).
 
+Normal native clicks scroll into view and check pointer actionability.
+Covered, disabled, or detached targets fail before dispatch. Success confirms
+dispatch, not navigation. When navigation is expected, use wait --url and get url.
+
 Options:
   --new-tab            Open link in a new tab instead of navigating current tab
                        (only works on elements with href attribute)

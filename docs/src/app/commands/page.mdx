@@ -37,6 +37,13 @@ agent-browser close                   # Close browser (aliases: quit, exit)
 agent-browser close --all             # Close all active sessions
 ```
 
+Normal native `click` scrolls the resolved target into view, measures a fresh
+viewport position, and checks pointer actionability. Covered, disabled, and
+detached targets fail before dispatch. Success acknowledges pointer dispatch,
+not application task completion or guaranteed navigation. When navigation is
+expected, use a bounded `wait --url` and inspect `get url`. DOM-only buttons,
+downloads, and new-tab links need not change the current tab's URL.
+
 ## Get info
 
 ```bash

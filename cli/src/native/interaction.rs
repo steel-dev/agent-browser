@@ -6,6 +6,8 @@ use super::cdp::client::CdpClient;
 use super::cdp::types::*;
 use super::element::{resolve_element_center, resolve_element_object_id, RefMap};
 
+/// Scroll and hit-test the resolved target before dispatching pointer input.
+/// Success acknowledges dispatch, not navigation or application task completion.
 pub async fn click(
     client: &CdpClient,
     session_id: &str,
@@ -15,7 +17,7 @@ pub async fn click(
     click_count: i32,
     iframe_sessions: &HashMap<String, String>,
 ) -> Result<(), String> {
-    let (x, y, effective_session_id) = resolve_element_center(
+    let (object_id, effective_session_id) = resolve_element_object_id(
         client,
         session_id,
         ref_map,
@@ -23,6 +25,105 @@ pub async fn click(
         iframe_sessions,
     )
     .await?;
+
+    // Resolve the original reference before scrolling, then calculate a fresh
+    // viewport position for that same object. Never navigate to its href or
+    // use a JavaScript click to bypass pointer actionability.
+    client
+        .send_command(
+            "DOM.scrollIntoViewIfNeeded",
+            Some(serde_json::json!({ "objectId": object_id })),
+            Some(&effective_session_id),
+        )
+        .await
+        .map_err(|error| format!("Click target could not be scrolled into view: {error}"))?;
+
+    // CDP box coordinates retain the existing frame-to-dispatch coordinate
+    // mapping. getBoundingClientRect below is local to the element's frame.
+    let geometry: DomGetBoxModelResult = client
+        .send_command_typed(
+            "DOM.getBoxModel",
+            &DomGetBoxModelParams {
+                backend_node_id: None,
+                node_id: None,
+                object_id: Some(object_id.clone()),
+            },
+            Some(&effective_session_id),
+        )
+        .await?;
+    // Match the border-box origin used by getBoundingClientRect, including
+    // asymmetric padding, so validation and dispatch refer to the same point.
+    let quad = &geometry.model.border;
+    if quad.len() != 8 {
+        return Err("Click target has no actionable position".to_string());
+    }
+    let dispatch_x = (quad[0] + quad[2] + quad[4] + quad[6]) / 4.0;
+    let dispatch_y = (quad[1] + quad[3] + quad[5] + quad[7]) / 4.0;
+
+    let result: EvaluateResult = client
+        .send_command_typed(
+            "Runtime.callFunctionOn",
+            &CallFunctionOnParams {
+                function_declaration: r#"function() {
+                    if (!this.isConnected) return { error: 'Click target is detached; take a fresh snapshot' };
+                    if (this.matches(':disabled')) return { error: 'Click target is disabled' };
+                    const doc = this.ownerDocument;
+                    const view = doc.defaultView;
+                    const style = view.getComputedStyle(this);
+                    if (style.visibility === 'hidden' || style.visibility === 'collapse') {
+                        return { error: 'Click target is hidden and not actionable' };
+                    }
+                    const rect = this.getBoundingClientRect();
+                    const left = Math.max(0, rect.left);
+                    const top = Math.max(0, rect.top);
+                    const right = Math.min(view.innerWidth, rect.right);
+                    const bottom = Math.min(view.innerHeight, rect.bottom);
+                    if (right <= left || bottom <= top) {
+                        return { error: 'Click target has no actionable area in the viewport' };
+                    }
+                    const x = (left + right) / 2;
+                    const y = (top + bottom) / 2;
+                    const root = this.getRootNode();
+                    let hit = typeof root.elementFromPoint === 'function'
+                        ? root.elementFromPoint(x, y) : doc.elementFromPoint(x, y);
+                    while (hit && hit.shadowRoot) {
+                        const nested = hit.shadowRoot.elementFromPoint(x, y);
+                        if (!nested || nested === hit) break;
+                        hit = nested;
+                    }
+                    for (let node = hit; node; node = node.parentNode || node.host) {
+                        if (node === this) return { x, y, centerX: (rect.left + rect.right) / 2, centerY: (rect.top + rect.bottom) / 2 };
+                    }
+                    return { error: 'Click target is covered or does not receive pointer input' };
+                }"#
+                .to_string(),
+                object_id: Some(object_id),
+                arguments: None,
+                return_by_value: Some(true),
+                await_promise: Some(false),
+            },
+            Some(&effective_session_id),
+        )
+        .await?;
+    if result.exception_details.is_some() {
+        return Err("Click target actionability check failed; take a fresh snapshot".to_string());
+    }
+    let point = result
+        .result
+        .value
+        .ok_or("Click target actionability returned no result")?;
+    if let Some(error) = point.get("error").and_then(Value::as_str) {
+        return Err(error.to_string());
+    }
+    let x = point.get("x").and_then(Value::as_f64);
+    let y = point.get("y").and_then(Value::as_f64);
+    let center_x = point.get("centerX").and_then(Value::as_f64);
+    let center_y = point.get("centerY").and_then(Value::as_f64);
+    let (Some(x), Some(y), Some(center_x), Some(center_y)) = (x, y, center_x, center_y) else {
+        return Err("Click target has no actionable position".to_string());
+    };
+    let x = dispatch_x + x - center_x;
+    let y = dispatch_y + y - center_y;
     dispatch_click(client, &effective_session_id, x, y, button, click_count).await
 }
 
@@ -1068,6 +1169,124 @@ fn named_key_info(key: &str) -> (String, String, i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::{SinkExt, StreamExt};
+    use std::sync::{Arc, Mutex};
+
+    async fn click_fixture(
+        error: Option<&str>,
+    ) -> (
+        CdpClient,
+        Arc<Mutex<Vec<Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let requests = Arc::clone(&seen);
+        let point = match error {
+            Some(error) => serde_json::json!({ "error": error }),
+            None => serde_json::json!({ "x": 30.0, "y": 40.0, "centerX": 30.0, "centerY": 40.0 }),
+        };
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) =
+                socket.next().await
+            {
+                let request: Value = serde_json::from_str(&text).unwrap();
+                let result = match request["method"].as_str().unwrap() {
+                    "Runtime.evaluate" => {
+                        serde_json::json!({ "result": { "type": "object", "objectId": "target" } })
+                    }
+                    "Runtime.callFunctionOn" => {
+                        serde_json::json!({ "result": { "type": "object", "value": point } })
+                    }
+                    "DOM.getBoxModel" => {
+                        let quad = [320.0, 230.0, 340.0, 230.0, 340.0, 250.0, 320.0, 250.0];
+                        let content = [332.0, 236.0, 338.0, 236.0, 338.0, 244.0, 332.0, 244.0];
+                        serde_json::json!({ "model": { "content": content, "border": quad, "padding": quad, "margin": quad, "width": 20, "height": 20 } })
+                    }
+                    _ => serde_json::json!({}),
+                };
+                requests.lock().unwrap().push(request.clone());
+                socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        serde_json::json!({ "id": request["id"], "result": result }).to_string(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        });
+        let client = CdpClient::connect(&url).await.unwrap();
+        (client, seen, task)
+    }
+
+    #[tokio::test]
+    async fn click_scrolls_before_measuring_and_dispatches_fresh_coordinates() {
+        let (client, seen, task) = click_fixture(None).await;
+        let result = click(
+            &client,
+            "page",
+            &RefMap::new(),
+            "#target",
+            "left",
+            1,
+            &HashMap::new(),
+        )
+        .await;
+        task.abort();
+        result.unwrap();
+        let requests = seen.lock().unwrap();
+        let methods: Vec<_> = requests
+            .iter()
+            .map(|value| value["method"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            methods[..4],
+            [
+                "Runtime.evaluate",
+                "DOM.scrollIntoViewIfNeeded",
+                "DOM.getBoxModel",
+                "Runtime.callFunctionOn"
+            ]
+        );
+        let input: Vec<_> = requests
+            .iter()
+            .filter(|value| value["method"] == "Input.dispatchMouseEvent")
+            .collect();
+        assert_eq!(input.len(), 3);
+        for request in input {
+            assert_eq!(request["params"]["x"], 330.0);
+            assert_eq!(request["params"]["y"], 240.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn unactionable_click_reports_error_without_dispatching_input() {
+        for error in [
+            "Click target is disabled",
+            "Click target is covered or does not receive pointer input",
+        ] {
+            let (client, seen, task) = click_fixture(Some(error)).await;
+            let result = click(
+                &client,
+                "page",
+                &RefMap::new(),
+                "#target",
+                "left",
+                1,
+                &HashMap::new(),
+            )
+            .await;
+            task.abort();
+            assert_eq!(result.unwrap_err(), error);
+            assert!(!seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|value| value["method"] == "Input.dispatchMouseEvent"));
+        }
+    }
 
     /// Verify that `char_to_key_info` returns the correct (key, code,
     /// windowsVirtualKeyCode) triple for every character in Playwright's
