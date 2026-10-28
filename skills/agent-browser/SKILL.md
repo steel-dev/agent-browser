@@ -233,6 +233,13 @@ agent-browser -v chat "fill in the login form"            # Verbose (show comman
 agent-browser --model openai/gpt-4o chat "take a screenshot"  # Override model
 ```
 
+Normal native clicks handle scrolling and pointer actionability; do not replace
+them with direct-href navigation or JavaScript clicks to bypass an obstruction.
+If a target is covered, disabled, or detached, follow the error or refresh the
+snapshot. A click acknowledgement is dispatch, not proof of navigation or task
+completion. When the task expects navigation, use a bounded `wait --url` and
+`get url`; unchanged URLs are valid for DOM-only buttons and downloads.
+
 ## Streaming
 
 Every session automatically starts a WebSocket stream server on an OS-assigned port. Use `agent-browser stream status` to see the bound port and connection state. Use `stream disable` to tear it down, and `stream enable --port <port>` to re-enable on a specific port.

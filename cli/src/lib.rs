@@ -5,3 +5,6 @@ pub mod flags;
 pub mod install;
 pub mod native;
 pub mod validation;
+
+#[cfg(test)]
+mod test_utils;
